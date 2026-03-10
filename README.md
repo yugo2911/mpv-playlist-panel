@@ -21,8 +21,6 @@ A thumbnail playlist panel for mpv with watched tracking.
 - [mpv](https://mpv.io)
 - [ffmpeg](https://ffmpeg.org) — `ffmpeg` and `ffprobe` must be in PATH
 
-Everything else (Lua, the `mp` library, ASS rendering, overlay system) is built into mpv itself.
-
 ## Installation
 
 ```
