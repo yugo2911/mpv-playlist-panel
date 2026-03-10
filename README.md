@@ -24,12 +24,17 @@ A thumbnail playlist panel for mpv with watched tracking.
 ## Installation
 
 ```
+Linux / macOS
 ~/.config/mpv/
 └── scripts/
-    └── playlist-panel.lua
-```
+    └── playlist-panel.lua  # Place file here
 
-> **Windows:** replace `~/.config/mpv/` with `%APPDATA%\mpv\`
+
+Windows
+%APPDATA%/mpv/
+└── scripts/
+    └── playlist-panel.lua  # Place file here
+```
 
 ffmpeg is available via ffmpeg.org or any package manager:
 ```
