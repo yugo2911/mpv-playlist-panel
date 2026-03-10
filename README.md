@@ -1,5 +1,3 @@
-# mpv-playlist-panel
-
 <img width="988" height="601" alt="image" src="https://github.com/user-attachments/assets/3eaeb3cd-d773-4088-b638-fcf510edc061" />
 
 
