@@ -2,6 +2,9 @@
 
 <img width="988" height="601" alt="image" src="https://github.com/user-attachments/assets/3eaeb3cd-d773-4088-b638-fcf510edc061" />
 
+
+---
+
 # playlist-panel.lua
 
 A thumbnail playlist panel for mpv with watched tracking.
@@ -11,7 +14,7 @@ A thumbnail playlist panel for mpv with watched tracking.
 - **Thumbnail previews** — generated via ffmpeg, cached per session
 - **Watched tracking** — ✓ marker and dimmed thumbnail, persisted across sessions
 - **Scrolling titles** — long names marquee-scroll on the focused row
-- **Duration display** — fetched in the background via ffprobe
+- **Duration display** — fetched via ffprobe
 - **Panel width cycling** — 3 sizes, toggle with `c`
 - **Adaptive resize** — debounced redraw on window resize
 
@@ -26,9 +29,8 @@ Everything else (Lua, the `mp` library, ASS rendering, overlay system) is built 
 
 ```
 ~/.config/mpv/
-├── scripts/
-│   └── playlist-panel.lua
-└── playlist-panel.conf   ← optional config
+└── scripts/
+    └── playlist-panel.lua
 ```
 
 > **Windows:** replace `~/.config/mpv/` with `%APPDATA%\mpv\`
