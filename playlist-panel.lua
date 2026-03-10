@@ -10,7 +10,7 @@ local o = {
     key_up     = "UP",    key_down   = "DOWN",
     key_select = "ENTER", key_cycle  = "c",
 
-    max_rows   = 6,       thumb_seek = 10,     -- rows visible; seconds into file for thumb
+    max_rows   = 6,       thumb_seek = 300,     -- rows visible; duration time at which to seek for thumbnail (sec) (make this % not sec to solve short videos)
 
     watched_pct      = 90,   watched_min_secs = 10,   -- % threshold; minimum playback secs
     watched_on_skip  = true,                          -- mark watched on skip / non-quit end
