@@ -248,8 +248,40 @@ end
 -- ── Thumbnail generation ───────────────────────────────────────────────────
 -- All thumbnails are generated at exactly RAW_W×RAW_H (272×152) with padding
 -- so the BGRA stride is always constant and safe to pass to overlay-add.
--- Watched dimming is handled by an ASS rectangle drawn on top in render(),
--- removing the need for a second BGRA file and eliminating a crash vector.
+--
+-- Watched dimming: mpv overlay-add always composites ABOVE the ASS layer, so
+-- an ASS rectangle cannot dim a thumbnail.  Instead we bake a second BGRA
+-- file with ffmpeg's lavfi color+overlay filter at generation time.  Both
+-- files are size-validated before caching so a corrupt result cannot crash
+-- the overlay-add call regardless of source video dimensions or codec.
+
+local thumb_cache_dim = {}  -- thumb_cache_dim[idx] = path to pre-dimmed .bgra
+
+-- Write a dimmed copy of a validated RAW_W×RAW_H BGRA file by scaling RGB
+-- channels in Lua.  factor = 1.0 (original) → 0.0 (black).
+-- Only called after the source file has been size-validated, so the
+-- #data ~= expected check is a hard assert rather than a silent skip.
+local function make_dim_thumb(idx, src)
+    local factor = 1.0 - clamp(o.watched_thumb_dim, 0, 255) / 255
+    local dst    = THUMB_DIR .. idx .. "_dim.bgra"
+    local f = io.open(src, "rb")
+    if not f then return end
+    local data = f:read("*a"); f:close()
+    if #data ~= RAW_W * RAW_H * 4 then return end  -- guard: src must be valid
+    local out = {}
+    for i = 1, #data, 4 do
+        out[#out+1] = string.char(
+            math.floor(data:byte(i)   * factor),
+            math.floor(data:byte(i+1) * factor),
+            math.floor(data:byte(i+2) * factor),
+            data:byte(i+3))
+    end
+    local wf = io.open(dst, "wb")
+    if not wf then return end
+    wf:write(table.concat(out)); wf:close()
+    thumb_cache_dim[idx] = dst
+    if visible and not resizing then render() end
+end
 
 local function gen_thumb(idx, path)
     if not path or path == "" or thumb_cache[idx] then return end
@@ -270,6 +302,9 @@ local function gen_thumb(idx, path)
                 local sz = f:seek("end"); f:close()
                 if sz == RAW_W * RAW_H * 4 then
                     thumb_cache[idx] = out
+                    if o.watched_thumb_dim > 0 then
+                        mp.add_timeout(0, function() make_dim_thumb(idx, out) end)
+                    end
                     if visible and not resizing then render() end
                 end
             end
@@ -372,11 +407,14 @@ render = function()
     ass:append(("{\\an6\\bord0\\shad0\\fs13\\1c&H333333&}%d / %d"):format(cursor + 1, #plist))
 
     -- Build map: which thumb file each visible row needs this frame.
+    -- Watched non-current rows use the pre-dimmed BGRA if available.
     local needed = {}
     for row = 0, rows - 1 do
-        local idx = scroll + row
-        if plist[idx + 1] and thumb_cache[idx] then
-            needed[row] = thumb_cache[idx]
+        local idx  = scroll + row
+        local item = plist[idx + 1]
+        if item and thumb_cache[idx] then
+            local use_dim = item.path and watched[item.path] and idx ~= current
+            needed[row]   = (use_dim and thumb_cache_dim[idx]) or thumb_cache[idx]
         end
     end
 
@@ -447,15 +485,6 @@ render = function()
                 })
                 overlay_state[row]   = needed[row]
                 overlay_pending[row] = nil
-            end
-
-            -- Dim watched thumbnails with an ASS rectangle overlay instead of
-            -- a pre-dimmed BGRA file.  Simpler and works regardless of video size.
-            if is_watched and not is_current and o.watched_thumb_dim > 0 then
-                local alpha = ("%02X"):format(255 - clamp(o.watched_thumb_dim, 0, 255))
-                ass:new_event(); ass:pos(0, 0)
-                ass:append(("{\\an7\\bord0\\shad0\\1c&H000000&\\1a&H%s&}"):format(alpha))
-                ass:draw_start(); ass:rect_cw(TX1, TY1, TX2, TY2); ass:draw_stop()
             end
         else
             -- Placeholder box; slightly darker for watched entries
