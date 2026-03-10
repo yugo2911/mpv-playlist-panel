@@ -251,7 +251,7 @@ local function make_dimmed_bgra(src, dst, factor)
     local f = io.open(src, "rb")
     if not f then return false end
     local data = f:read("*a"); f:close()
-    if #data ~= 272 * 152 * 4 then return false end
+    if #data == 0 or #data % 4 ~= 0 then return false end
     local out = {}
     for i = 1, #data, 4 do
         local b = data:byte(i)   * factor
@@ -263,7 +263,32 @@ local function make_dimmed_bgra(src, dst, factor)
     local wf = io.open(dst, "wb")
     if not wf then return false end
     wf:write(table.concat(out)); wf:close()
-    return true
+    return true, #data / 4  -- return pixel count so caller knows real dimensions
+end
+
+local function gen_thumb(idx, path)
+    if not path or path == "" or thumb_cache[idx] then return end
+    local out = THUMB_DIR .. idx .. ".bgra"
+    mp.command_native_async({
+        name = "subprocess", playback_only = false,
+        args = {"ffmpeg", "-loglevel", "quiet", "-y",
+                "-ss", tostring(o.thumb_seek), "-i", path, "-vframes", "1",
+                "-vf", "scale=272:152:force_original_aspect_ratio=decrease,"
+                    .. "pad=272:152:(ow-iw)/2:(oh-ih)/2,format=bgra",
+                "-f", "rawvideo", out},
+    }, function(_, res)
+        if res and res.status == 0 then
+            thumb_cache[idx] = out
+            local dim_factor = 1.0 - clamp(o.watched_thumb_dim, 0, 255) / 255
+            local dim_out    = THUMB_DIR .. idx .. "_dim.bgra"
+            mp.add_timeout(0, function()
+                if make_dimmed_bgra(out, dim_out, dim_factor) then
+                    thumb_cache_dim[idx] = dim_out
+                end
+                if visible and not resizing then render() end
+            end)
+        end
+    end)
 end
 
 local function gen_thumb(idx, path)
