@@ -29,6 +29,10 @@ local REF_W, REF_H            = 1280, 720
 local ROW_H, THUMB_W, THUMB_H = 88, 136, 76
 local HDR_H, CK_W, HANDLE_W   = 46, 32, 6
 
+-- Fixed raw frame size used by ffmpeg and every overlay-add call.
+-- Must be constant: overlay-add stride depends on it and must never vary.
+local RAW_W, RAW_H = 272, 152
+
 -- Panel width cycling: STEP_COUNT steps, each STEP_PCT of REF_W
 local STEP_COUNT, STEP_PCT, panel_step = 3, 0.20, 2
 local function panel_w() return math.floor(REF_W * panel_step * STEP_PCT) end
@@ -55,7 +59,9 @@ local thumb_cache    = {}
 local duration_cache = {}
 
 -- Track what is shown in each overlay slot; only call overlay-add on change.
-local overlay_state = {}  -- overlay_state[row] = filepath or nil
+-- overlay_pending[row] guards against concurrent async callbacks on the same slot.
+local overlay_state   = {}
+local overlay_pending = {}
 
 
 -- ── Watched tracking ───────────────────────────────────────────────────────
@@ -199,7 +205,8 @@ end
 local function clear_thumb_overlays()
     for i = 0, o.max_rows + 1 do
         mp.command_native({name = "overlay-remove", id = i + 10})
-        overlay_state[i] = nil
+        overlay_state[i]   = nil
+        overlay_pending[i] = nil
     end
 end
 
@@ -239,32 +246,10 @@ end
 
 
 -- ── Thumbnail generation ───────────────────────────────────────────────────
--- thumb_cache[idx]      = path to full-brightness .bgra
--- thumb_cache_dim[idx]  = path to pre-dimmed .bgra (watched entries)
-
-local thumb_cache_dim = {}
-
--- Write a dimmed copy of a BGRA file by scaling RGB channels in Lua.
--- alpha_factor: 0.0 (black) – 1.0 (original).  Runs synchronously but the
--- files are small (272×152×4 = ~166 KB) so it's fast enough.
-local function make_dimmed_bgra(src, dst, factor)
-    local f = io.open(src, "rb")
-    if not f then return false end
-    local data = f:read("*a"); f:close()
-    if #data == 0 or #data % 4 ~= 0 then return false end
-    local out = {}
-    for i = 1, #data, 4 do
-        local b = data:byte(i)   * factor
-        local g = data:byte(i+1) * factor
-        local r = data:byte(i+2) * factor
-        local a = data:byte(i+3)
-        out[#out+1] = string.char(math.floor(b), math.floor(g), math.floor(r), a)
-    end
-    local wf = io.open(dst, "wb")
-    if not wf then return false end
-    wf:write(table.concat(out)); wf:close()
-    return true, #data / 4  -- return pixel count so caller knows real dimensions
-end
+-- All thumbnails are generated at exactly RAW_W×RAW_H (272×152) with padding
+-- so the BGRA stride is always constant and safe to pass to overlay-add.
+-- Watched dimming is handled by an ASS rectangle drawn on top in render(),
+-- removing the need for a second BGRA file and eliminating a crash vector.
 
 local function gen_thumb(idx, path)
     if not path or path == "" or thumb_cache[idx] then return end
@@ -273,44 +258,21 @@ local function gen_thumb(idx, path)
         name = "subprocess", playback_only = false,
         args = {"ffmpeg", "-loglevel", "quiet", "-y",
                 "-ss", tostring(o.thumb_seek), "-i", path, "-vframes", "1",
-                "-vf", "scale=272:152:force_original_aspect_ratio=decrease,"
-                    .. "pad=272:152:(ow-iw)/2:(oh-ih)/2,format=bgra",
+                "-vf", ("scale=%d:%d:force_original_aspect_ratio=decrease,"
+                     .. "pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=bgra"):format(
+                     RAW_W, RAW_H, RAW_W, RAW_H),
                 "-f", "rawvideo", out},
     }, function(_, res)
         if res and res.status == 0 then
-            thumb_cache[idx] = out
-            local dim_factor = 1.0 - clamp(o.watched_thumb_dim, 0, 255) / 255
-            local dim_out    = THUMB_DIR .. idx .. "_dim.bgra"
-            mp.add_timeout(0, function()
-                if make_dimmed_bgra(out, dim_out, dim_factor) then
-                    thumb_cache_dim[idx] = dim_out
+            -- Validate file size before caching: wrong size = corrupt overlay crash.
+            local f = io.open(out, "rb")
+            if f then
+                local sz = f:seek("end"); f:close()
+                if sz == RAW_W * RAW_H * 4 then
+                    thumb_cache[idx] = out
+                    if visible and not resizing then render() end
                 end
-                if visible and not resizing then render() end
-            end)
-        end
-    end)
-end
-
-local function gen_thumb(idx, path)
-    if not path or path == "" or thumb_cache[idx] then return end
-    local out = THUMB_DIR .. idx .. ".bgra"
-    mp.command_native_async({
-        name = "subprocess", playback_only = false,
-        args = {"ffmpeg", "-loglevel", "quiet", "-y",
-                "-ss", tostring(o.thumb_seek), "-i", path, "-vframes", "1",
-                "-vf", "scale=272:152:force_original_aspect_ratio=decrease,"
-                    .. "pad=272:152:(ow-iw)/2:(oh-ih)/2,format=bgra",
-                "-f", "rawvideo", out},
-    }, function(_, res)
-        if res and res.status == 0 then
-            thumb_cache[idx] = out
-            -- Pre-generate dimmed version (factor = 1 - dim_alpha/255)
-            local dim_factor = 1.0 - clamp(o.watched_thumb_dim, 0, 255) / 255
-            local dim_out    = THUMB_DIR .. idx .. "_dim.bgra"
-            if make_dimmed_bgra(out, dim_out, dim_factor) then
-                thumb_cache_dim[idx] = dim_out
             end
-            if visible and not resizing then render() end
         end
     end)
 end
@@ -361,6 +323,11 @@ render = function()
     local PX2    = PX + PW
     local PY2    = PY + HDR_H + rows * ROW_H
 
+    -- Precompute display size for overlays once; both position and dw/dh use the
+    -- same sw/sh so the thumbnail never lands outside the framebuffer.
+    local dw = math.floor(THUMB_W * sw)
+    local dh = math.floor(THUMB_H * sh)
+
     local ass = assdraw.ass_new()
 
     -- Drop shadow
@@ -404,23 +371,21 @@ render = function()
     ass:new_event(); ass:pos(PX2 - 16, PY + HDR_H / 2)
     ass:append(("{\\an6\\bord0\\shad0\\fs13\\1c&H333333&}%d / %d"):format(cursor + 1, #plist))
 
-    -- Build map of which overlay file each visible row needs this frame.
-    -- Watched non-current rows use the pre-dimmed BGRA if available.
+    -- Build map: which thumb file each visible row needs this frame.
     local needed = {}
     for row = 0, rows - 1 do
-        local idx  = scroll + row
-        local item = plist[idx + 1]
-        if item and thumb_cache[idx] then
-            local use_dim = item.path and watched[item.path] and idx ~= current
-            needed[row]   = (use_dim and thumb_cache_dim[idx]) or thumb_cache[idx]
+        local idx = scroll + row
+        if plist[idx + 1] and thumb_cache[idx] then
+            needed[row] = thumb_cache[idx]
         end
     end
 
-    -- Remove overlay slots no longer needed or whose file changed
+    -- Remove overlay slots no longer needed or whose file changed.
     for row = 0, o.max_rows + 1 do
         if overlay_state[row] and overlay_state[row] ~= needed[row] then
             mp.command_native({name = "overlay-remove", id = row + 10})
-            overlay_state[row] = nil
+            overlay_state[row]   = nil
+            overlay_pending[row] = nil
         end
     end
 
@@ -463,26 +428,37 @@ render = function()
             ass:append("{\\an5\\bord0\\shad0\\fs11\\1c&H336633&}✓")
         end
 
-        -- Thumbnail coordinates
+        -- Thumbnail coordinates (virtual-px space)
         local TX1 = PX + HANDLE_W + CK_W
         local TY1 = RY1 + math.floor((ROW_H - THUMB_H) / 2)
         local TX2 = TX1 + THUMB_W
         local TY2 = TY1 + THUMB_H
 
         if needed[row] then
-            -- Issue overlay-add only when slot content is new
-            if overlay_state[row] ~= needed[row] then
+            -- Issue overlay-add only when slot content is new and not already in flight.
+            if overlay_state[row] ~= needed[row] and not overlay_pending[row] then
+                overlay_pending[row] = true
                 mp.command_native({
                     name   = "overlay-add", id = row + 10,
-                    x      = math.floor(TX1 * sw), y      = math.floor(TY1 * sh),
+                    x      = math.floor(TX1 * sw), y  = math.floor(TY1 * sh),
                     file   = needed[row],           offset = 0, fmt = "bgra",
-                    w      = 272, h = 152,          stride = 272 * 4,
-                    dw     = math.floor(THUMB_W * sw), dh = math.floor(THUMB_H * sh),
+                    w      = RAW_W, h = RAW_H,      stride = RAW_W * 4,
+                    dw     = dw,    dh = dh,
                 })
-                overlay_state[row] = needed[row]
+                overlay_state[row]   = needed[row]
+                overlay_pending[row] = nil
+            end
+
+            -- Dim watched thumbnails with an ASS rectangle overlay instead of
+            -- a pre-dimmed BGRA file.  Simpler and works regardless of video size.
+            if is_watched and not is_current and o.watched_thumb_dim > 0 then
+                local alpha = ("%02X"):format(255 - clamp(o.watched_thumb_dim, 0, 255))
+                ass:new_event(); ass:pos(0, 0)
+                ass:append(("{\\an7\\bord0\\shad0\\1c&H000000&\\1a&H%s&}"):format(alpha))
+                ass:draw_start(); ass:rect_cw(TX1, TY1, TX2, TY2); ass:draw_stop()
             end
         else
-            -- Placeholder box; darker shade for watched entries
+            -- Placeholder box; slightly darker for watched entries
             local ph_clr = is_watched and "111111" or "1A1A1A"
             ass:new_event(); ass:pos(0, 0)
             ass:append(("{\\an7\\bord0\\shad0\\1c&H%s&\\1a&H00&}"):format(ph_clr))
@@ -549,7 +525,8 @@ local function cycle_size()
     panel_step = (panel_step % STEP_COUNT) + 1
     for i = 0, o.max_rows + 1 do
         mp.command_native({name = "overlay-remove", id = i + 10})
-        overlay_state[i] = nil
+        overlay_state[i]   = nil
+        overlay_pending[i] = nil
     end
     render()
 end
